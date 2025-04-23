@@ -13,6 +13,29 @@ from torch import nn
 from torch.optim.lr_scheduler import PolynomialLR
 from torchvision.transforms import functional as F, InterpolationMode
 
+import lightning as L
+
+class CustomModel(L.LightningModule):
+    def __init__(self, model, num_classes):
+        super().__init__()
+        self.model = model
+        self.num_classes = num_classes
+
+    def forward(self, x):
+        return self.model(x)
+
+    def training_step(self, batch, batch_idx):
+        images, targets = batch
+        outputs = self(images)
+        loss = criterion(outputs, targets)
+        return loss
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(
+            self.parameters(),
+            lr=1e-3,
+        )
+        return [optimizer]
 
 def get_dataset(args, is_train):
     def sbd(*args, **kwargs):
@@ -134,8 +157,6 @@ def main(args):
 
     if args.output_dir:
         utils.mkdir(args.output_dir)
-
-    # utils.init_distributed_mode(args)
 
     device = torch.device(args.device)
 

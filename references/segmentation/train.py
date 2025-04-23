@@ -21,7 +21,8 @@ def get_dataset(args, is_train):
 
     def voc(*args, **kwargs):
         kwargs.pop("use_v2")
-        return torchvision.datasets.VOCSegmentation(*args, **kwargs)
+        return torchvision.datasets.VOCSegmentation(download=True,
+                                                    *args, **kwargs)
 
     paths = {
         "voc": (args.data_path, voc, 21),
@@ -135,7 +136,7 @@ def main(args):
     if args.output_dir:
         utils.mkdir(args.output_dir)
 
-    utils.init_distributed_mode(args)
+    # utils.init_distributed_mode(args)
     print(args)
 
     device = torch.device(args.device)

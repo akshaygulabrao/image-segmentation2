@@ -21,8 +21,7 @@ def get_dataset(args, is_train):
 
     def voc(*args, **kwargs):
         kwargs.pop("use_v2")
-        return torchvision.datasets.VOCSegmentation(download=True,
-                                                    *args, **kwargs)
+        return torchvision.datasets.VOCSegmentation(*args, **kwargs)
 
     paths = {
         "voc": (args.data_path, voc, 21),
@@ -137,7 +136,6 @@ def main(args):
         utils.mkdir(args.output_dir)
 
     # utils.init_distributed_mode(args)
-    print(args)
 
     device = torch.device(args.device)
 
@@ -147,9 +145,13 @@ def main(args):
     else:
         torch.backends.cudnn.benchmark = True
 
+    print("starting dataset download!")
     dataset, num_classes = get_dataset(args, is_train=True)
     dataset_test, _ = get_dataset(args, is_train=False)
+    print("dataset downloaded!")
+    args.distributed = False
 
+    
     if args.distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
         test_sampler = torch.utils.data.distributed.DistributedSampler(dataset_test, shuffle=False)

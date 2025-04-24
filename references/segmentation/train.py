@@ -13,6 +13,8 @@ from torch import nn
 from torch.optim.lr_scheduler import PolynomialLR
 from torchvision.transforms import functional as F, InterpolationMode
 
+from torchmetrics import Accuracy,JaccardIndex,F1Score
+
 import lightning as L
 
 class CustomModel(L.LightningModule):
@@ -21,14 +23,49 @@ class CustomModel(L.LightningModule):
         self.model = model
         self.num_classes = num_classes
 
+        self.train_acc = Accuracy(task="multiclass", num_classes=num_classes, average="macro",ignore_index=255)
+        self.train_iou = JaccardIndex(task="multiclass", num_classes=num_classes,ignore_index=255)
+        self.train_f1 = F1Score(task="multiclass", num_classes=num_classes,ignore_index=255)
+
+
+        self.val_acc = Accuracy(task="multiclass",num_classes=num_classes, average="macro",ignore_index=255)
+        self.val_iou = JaccardIndex(task="multiclass",num_classes=num_classes,ignore_index=255)
+        self.val_f1 = F1Score(task="multiclass",num_classes=num_classes,ignore_index=255)
+
     def forward(self, x):
         return self.model(x)
 
     def training_step(self, batch, batch_idx):
         images, targets = batch
         outputs = self(images)
-        loss = criterion(outputs, targets)
+        loss = nn.functional.cross_entropy(outputs, targets,ignore_index=255)
+        
+        preds = torch.argmax(outputs["out"], dim=1)
+        acc = self.train_acc(preds, targets)
+        iou = self.train_iou(preds, targets)
+        f1 = self.train_f1(preds, targets)
+        self.log("train_loss", loss, on_epoch=True)
+        self.log("train_acc", acc, on_epoch=True)
+        self.log("train_iou", iou, on_epoch=True)
+        self.log("train_f1", f1, on_epoch=True)
         return loss
+
+    
+    def validation_step(self, batch, batch_idx):
+        images, targets = batch
+        outputs = self(images)
+        loss = nn.functional.cross_entropy(outputs["out"], targets, ignore_index=255)
+        
+        preds = torch.argmax(outputs["out"], dim=1)
+        acc = self.val_acc(preds, targets)
+        iou = self.val_iou(preds, targets)
+        f1 = self.val_f1(preds, targets)
+        self.log("val_loss", loss, on_epoch=True)
+        self.log("val_acc", acc, on_epoch=True)
+        self.log("val_iou", iou, on_epoch=True)
+        self.log("val_f1", f1, on_epoch=True)
+        return loss
+
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(
@@ -166,10 +203,8 @@ def main(args):
     else:
         torch.backends.cudnn.benchmark = True
 
-    print("starting dataset download!")
     dataset, num_classes = get_dataset(args, is_train=True)
     dataset_test, _ = get_dataset(args, is_train=False)
-    print("dataset downloaded!")
     args.distributed = False
 
     
@@ -177,8 +212,8 @@ def main(args):
         train_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
         test_sampler = torch.utils.data.distributed.DistributedSampler(dataset_test, shuffle=False)
     else:
-        train_sampler = torch.utils.data.RandomSampler(dataset)
-        test_sampler = torch.utils.data.SequentialSampler(dataset_test)
+        train_sampler = torch.utils.data.RandomSampler(dataset_test)
+        test_sampler = torch.utils.data.SequentialSampler(dataset)
 
     data_loader = torch.utils.data.DataLoader(
         dataset,
@@ -190,7 +225,7 @@ def main(args):
     )
 
     data_loader_test = torch.utils.data.DataLoader(
-        dataset_test, batch_size=1, sampler=test_sampler, num_workers=args.workers, collate_fn=utils.collate_fn
+        dataset_test, batch_size=args.batch_size, sampler=test_sampler, num_workers=args.workers,collate_fn=utils.collate_fn
     )
 
     model = torchvision.models.get_model(
@@ -200,92 +235,107 @@ def main(args):
         num_classes=num_classes,
         aux_loss=args.aux_loss,
     )
-    model.to(device)
-    if args.distributed:
-        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
 
-    model_without_ddp = model
-    if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
-        model_without_ddp = model.module
-
-    params_to_optimize = [
-        {"params": [p for p in model_without_ddp.backbone.parameters() if p.requires_grad]},
-        {"params": [p for p in model_without_ddp.classifier.parameters() if p.requires_grad]},
-    ]
-    if args.aux_loss:
-        params = [p for p in model_without_ddp.aux_classifier.parameters() if p.requires_grad]
-        params_to_optimize.append({"params": params, "lr": args.lr * 10})
-    optimizer = torch.optim.SGD(params_to_optimize, lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
-
-    scaler = torch.cuda.amp.GradScaler() if args.amp else None
-
-    iters_per_epoch = len(data_loader)
-    main_lr_scheduler = PolynomialLR(
-        optimizer, total_iters=iters_per_epoch * (args.epochs - args.lr_warmup_epochs), power=0.9
+    t0 = CustomModel(model, num_classes)
+    trainer = L.Trainer(
+        accelerator="auto",
+        devices=1,
+        overfit_batches=10,
+        max_epochs=args.epochs,
+        callbacks=[L.pytorch.callbacks.EarlyStopping(monitor="val_loss", patience=3)],
+        
     )
+    trainer.validate(t0,data_loader)
+    trainer.validate(t0,data_loader_test)
 
-    if args.lr_warmup_epochs > 0:
-        warmup_iters = iters_per_epoch * args.lr_warmup_epochs
-        args.lr_warmup_method = args.lr_warmup_method.lower()
-        if args.lr_warmup_method == "linear":
-            warmup_lr_scheduler = torch.optim.lr_scheduler.LinearLR(
-                optimizer, start_factor=args.lr_warmup_decay, total_iters=warmup_iters
-            )
-        elif args.lr_warmup_method == "constant":
-            warmup_lr_scheduler = torch.optim.lr_scheduler.ConstantLR(
-                optimizer, factor=args.lr_warmup_decay, total_iters=warmup_iters
-            )
-        else:
-            raise RuntimeError(
-                f"Invalid warmup lr method '{args.lr_warmup_method}'. Only linear and constant are supported."
-            )
-        lr_scheduler = torch.optim.lr_scheduler.SequentialLR(
-            optimizer, schedulers=[warmup_lr_scheduler, main_lr_scheduler], milestones=[warmup_iters]
-        )
-    else:
-        lr_scheduler = main_lr_scheduler
 
-    if args.resume:
-        checkpoint = torch.load(args.resume, map_location="cpu", weights_only=True)
-        model_without_ddp.load_state_dict(checkpoint["model"], strict=not args.test_only)
-        if not args.test_only:
-            optimizer.load_state_dict(checkpoint["optimizer"])
-            lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
-            args.start_epoch = checkpoint["epoch"] + 1
-            if args.amp:
-                scaler.load_state_dict(checkpoint["scaler"])
 
-    if args.test_only:
-        # We disable the cudnn benchmarking because it can noticeably affect the accuracy
-        torch.backends.cudnn.benchmark = False
-        torch.backends.cudnn.deterministic = True
-        confmat = evaluate(model, data_loader_test, device=device, num_classes=num_classes)
-        print(confmat)
-        return
+    # model.to(device)
+    # if args.distributed:
+    #     model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
 
-    start_time = time.time()
-    for epoch in range(args.start_epoch, args.epochs):
-        if args.distributed:
-            train_sampler.set_epoch(epoch)
-        train_one_epoch(model, criterion, optimizer, data_loader, lr_scheduler, device, epoch, args.print_freq, scaler)
-        confmat = evaluate(model, data_loader_test, device=device, num_classes=num_classes)
-        print(confmat)
-        checkpoint = {
-            "model": model_without_ddp.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "lr_scheduler": lr_scheduler.state_dict(),
-            "epoch": epoch,
-            "args": args,
-        }
-        if args.amp:
-            checkpoint["scaler"] = scaler.state_dict()
-        utils.save_on_master(checkpoint, os.path.join(args.output_dir, f"model_{epoch}.pth"))
-        utils.save_on_master(checkpoint, os.path.join(args.output_dir, "checkpoint.pth"))
+    # model_without_ddp = model
+    # if args.distributed:
+    #     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+    #     model_without_ddp = model.module
 
-    total_time = time.time() - start_time
-    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print(f"Training time {total_time_str}")
+    # params_to_optimize = [
+    #     {"params": [p for p in model_without_ddp.backbone.parameters() if p.requires_grad]},
+    #     {"params": [p for p in model_without_ddp.classifier.parameters() if p.requires_grad]},
+    # ]
+    # if args.aux_loss:
+    #     params = [p for p in model_without_ddp.aux_classifier.parameters() if p.requires_grad]
+    #     params_to_optimize.append({"params": params, "lr": args.lr * 10})
+    # optimizer = torch.optim.SGD(params_to_optimize, lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
+
+    # scaler = torch.cuda.amp.GradScaler() if args.amp else None
+
+    # iters_per_epoch = len(data_loader)
+    # main_lr_scheduler = PolynomialLR(
+    #     optimizer, total_iters=iters_per_epoch * (args.epochs - args.lr_warmup_epochs), power=0.9
+    # )
+
+    # if args.lr_warmup_epochs > 0:
+    #     warmup_iters = iters_per_epoch * args.lr_warmup_epochs
+    #     args.lr_warmup_method = args.lr_warmup_method.lower()
+    #     if args.lr_warmup_method == "linear":
+    #         warmup_lr_scheduler = torch.optim.lr_scheduler.LinearLR(
+    #             optimizer, start_factor=args.lr_warmup_decay, total_iters=warmup_iters
+    #         )
+    #     elif args.lr_warmup_method == "constant":
+    #         warmup_lr_scheduler = torch.optim.lr_scheduler.ConstantLR(
+    #             optimizer, factor=args.lr_warmup_decay, total_iters=warmup_iters
+    #         )
+    #     else:
+    #         raise RuntimeError(
+    #             f"Invalid warmup lr method '{args.lr_warmup_method}'. Only linear and constant are supported."
+    #         )
+    #     lr_scheduler = torch.optim.lr_scheduler.SequentialLR(
+    #         optimizer, schedulers=[warmup_lr_scheduler, main_lr_scheduler], milestones=[warmup_iters]
+    #     )
+    # else:
+    #     lr_scheduler = main_lr_scheduler
+
+    # if args.resume:
+    #     checkpoint = torch.load(args.resume, map_location="cpu", weights_only=True)
+    #     model_without_ddp.load_state_dict(checkpoint["model"], strict=not args.test_only)
+    #     if not args.test_only:
+    #         optimizer.load_state_dict(checkpoint["optimizer"])
+    #         lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
+    #         args.start_epoch = checkpoint["epoch"] + 1
+    #         if args.amp:
+    #             scaler.load_state_dict(checkpoint["scaler"])
+
+    # if args.test_only:
+    #     # We disable the cudnn benchmarking because it can noticeably affect the accuracy
+    #     torch.backends.cudnn.benchmark = False
+    #     torch.backends.cudnn.deterministic = True
+    #     confmat = evaluate(model, data_loader_test, device=device, num_classes=num_classes)
+    #     print(confmat)
+    #     return
+
+    # start_time = time.time()
+    # for epoch in range(args.start_epoch, args.epochs):
+    #     if args.distributed:
+    #         train_sampler.set_epoch(epoch)
+    #     train_one_epoch(model, criterion, optimizer, data_loader, lr_scheduler, device, epoch, args.print_freq, scaler)
+    #     confmat = evaluate(model, data_loader_test, device=device, num_classes=num_classes)
+    #     print(confmat)
+    #     checkpoint = {
+    #         "model": model_without_ddp.state_dict(),
+    #         "optimizer": optimizer.state_dict(),
+    #         "lr_scheduler": lr_scheduler.state_dict(),
+    #         "epoch": epoch,
+    #         "args": args,
+    #     }
+    #     if args.amp:
+    #         checkpoint["scaler"] = scaler.state_dict()
+    #     utils.save_on_master(checkpoint, os.path.join(args.output_dir, f"model_{epoch}.pth"))
+    #     utils.save_on_master(checkpoint, os.path.join(args.output_dir, "checkpoint.pth"))
+
+    # total_time = time.time() - start_time
+    # total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+    # print(f"Training time {total_time_str}")
 
 
 def get_args_parser(add_help=True):

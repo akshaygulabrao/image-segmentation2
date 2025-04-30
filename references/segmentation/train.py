@@ -38,7 +38,7 @@ class CustomModel(L.LightningModule):
     def training_step(self, batch, batch_idx):
         images, targets = batch
         outputs = self(images)
-        loss = nn.functional.cross_entropy(outputs, targets,ignore_index=255)
+        loss = nn.functional.cross_entropy(outputs["out"], targets,ignore_index=255)
         
         preds = torch.argmax(outputs["out"], dim=1)
         acc = self.train_acc(preds, targets)
@@ -212,10 +212,10 @@ def main(args):
         train_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
         test_sampler = torch.utils.data.distributed.DistributedSampler(dataset_test, shuffle=False)
     else:
-        train_sampler = torch.utils.data.RandomSampler(dataset_test)
-        test_sampler = torch.utils.data.SequentialSampler(dataset)
+        train_sampler = torch.utils.data.RandomSampler(dataset)
+        test_sampler = torch.utils.data.SequentialSampler(dataset_test)
 
-    data_loader = torch.utils.data.DataLoader(
+    train_dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_size=args.batch_size,
         sampler=train_sampler,
@@ -224,8 +224,13 @@ def main(args):
         drop_last=True,
     )
 
-    data_loader_test = torch.utils.data.DataLoader(
-        dataset_test, batch_size=args.batch_size, sampler=test_sampler, num_workers=args.workers,collate_fn=utils.collate_fn
+    val_dataloader = torch.utils.data.DataLoader(
+        dataset_test, 
+        batch_size=args.batch_size, 
+        sampler=test_sampler, 
+        num_workers=args.workers,
+        collate_fn=utils.collate_fn,
+        drop_last=True
     )
 
     model = torchvision.models.get_model(
@@ -240,13 +245,13 @@ def main(args):
     trainer = L.Trainer(
         accelerator="auto",
         devices=1,
-        overfit_batches=10,
         max_epochs=args.epochs,
         callbacks=[L.pytorch.callbacks.EarlyStopping(monitor="val_loss", patience=3)],
         
     )
-    trainer.validate(t0,data_loader)
-    trainer.validate(t0,data_loader_test)
+    trainer.fit(model=t0,
+                train_dataloaders=train_dataloader,
+                val_dataloaders=val_dataloader)
 
 
 

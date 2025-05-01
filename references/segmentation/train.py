@@ -16,6 +16,7 @@ from torchvision.transforms import functional as F, InterpolationMode
 from torchmetrics import Accuracy,JaccardIndex,F1Score
 
 import lightning as L
+import wandb
 
 class CustomModel(L.LightningModule):
     def __init__(self, model, num_classes):
@@ -44,10 +45,10 @@ class CustomModel(L.LightningModule):
         acc = self.train_acc(preds, targets)
         iou = self.train_iou(preds, targets)
         f1 = self.train_f1(preds, targets)
-        self.log("train_loss", loss, on_epoch=True)
-        self.log("train_acc", acc, on_epoch=True)
-        self.log("train_iou", iou, on_epoch=True)
-        self.log("train_f1", f1, on_epoch=True)
+        self.log("train_loss", loss)
+        self.log("train_acc", acc)
+        self.log("train_iou", iou)
+        self.log("train_f1", f1)
         return loss
 
     
@@ -60,10 +61,10 @@ class CustomModel(L.LightningModule):
         acc = self.val_acc(preds, targets)
         iou = self.val_iou(preds, targets)
         f1 = self.val_f1(preds, targets)
-        self.log("val_loss", loss, on_epoch=True)
-        self.log("val_acc", acc, on_epoch=True)
-        self.log("val_iou", iou, on_epoch=True)
-        self.log("val_f1", f1, on_epoch=True)
+        self.log("val_loss", loss)
+        self.log("val_acc", acc)
+        self.log("val_iou", iou)
+        self.log("val_f1", f1)
         return loss
 
 
@@ -241,10 +242,16 @@ def main(args):
         aux_loss=args.aux_loss,
     )
 
+    if args.wandb_key:
+        wandb.login(key=args.wandb_key)
+        wandb_logger = L.pytorch.loggers.WandbLogger(project="image-segmentation")
+
     t0 = CustomModel(model, num_classes)
     trainer = L.Trainer(
         accelerator="auto",
         devices=1,
+        log_every_n_steps=10,
+        logger = wandb_logger,
         max_epochs=args.epochs,
         callbacks=[L.pytorch.callbacks.EarlyStopping(monitor="val_loss", patience=3)],
         
@@ -252,95 +259,6 @@ def main(args):
     trainer.fit(model=t0,
                 train_dataloaders=train_dataloader,
                 val_dataloaders=val_dataloader)
-
-
-
-    # model.to(device)
-    # if args.distributed:
-    #     model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-
-    # model_without_ddp = model
-    # if args.distributed:
-    #     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
-    #     model_without_ddp = model.module
-
-    # params_to_optimize = [
-    #     {"params": [p for p in model_without_ddp.backbone.parameters() if p.requires_grad]},
-    #     {"params": [p for p in model_without_ddp.classifier.parameters() if p.requires_grad]},
-    # ]
-    # if args.aux_loss:
-    #     params = [p for p in model_without_ddp.aux_classifier.parameters() if p.requires_grad]
-    #     params_to_optimize.append({"params": params, "lr": args.lr * 10})
-    # optimizer = torch.optim.SGD(params_to_optimize, lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
-
-    # scaler = torch.cuda.amp.GradScaler() if args.amp else None
-
-    # iters_per_epoch = len(data_loader)
-    # main_lr_scheduler = PolynomialLR(
-    #     optimizer, total_iters=iters_per_epoch * (args.epochs - args.lr_warmup_epochs), power=0.9
-    # )
-
-    # if args.lr_warmup_epochs > 0:
-    #     warmup_iters = iters_per_epoch * args.lr_warmup_epochs
-    #     args.lr_warmup_method = args.lr_warmup_method.lower()
-    #     if args.lr_warmup_method == "linear":
-    #         warmup_lr_scheduler = torch.optim.lr_scheduler.LinearLR(
-    #             optimizer, start_factor=args.lr_warmup_decay, total_iters=warmup_iters
-    #         )
-    #     elif args.lr_warmup_method == "constant":
-    #         warmup_lr_scheduler = torch.optim.lr_scheduler.ConstantLR(
-    #             optimizer, factor=args.lr_warmup_decay, total_iters=warmup_iters
-    #         )
-    #     else:
-    #         raise RuntimeError(
-    #             f"Invalid warmup lr method '{args.lr_warmup_method}'. Only linear and constant are supported."
-    #         )
-    #     lr_scheduler = torch.optim.lr_scheduler.SequentialLR(
-    #         optimizer, schedulers=[warmup_lr_scheduler, main_lr_scheduler], milestones=[warmup_iters]
-    #     )
-    # else:
-    #     lr_scheduler = main_lr_scheduler
-
-    # if args.resume:
-    #     checkpoint = torch.load(args.resume, map_location="cpu", weights_only=True)
-    #     model_without_ddp.load_state_dict(checkpoint["model"], strict=not args.test_only)
-    #     if not args.test_only:
-    #         optimizer.load_state_dict(checkpoint["optimizer"])
-    #         lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
-    #         args.start_epoch = checkpoint["epoch"] + 1
-    #         if args.amp:
-    #             scaler.load_state_dict(checkpoint["scaler"])
-
-    # if args.test_only:
-    #     # We disable the cudnn benchmarking because it can noticeably affect the accuracy
-    #     torch.backends.cudnn.benchmark = False
-    #     torch.backends.cudnn.deterministic = True
-    #     confmat = evaluate(model, data_loader_test, device=device, num_classes=num_classes)
-    #     print(confmat)
-    #     return
-
-    # start_time = time.time()
-    # for epoch in range(args.start_epoch, args.epochs):
-    #     if args.distributed:
-    #         train_sampler.set_epoch(epoch)
-    #     train_one_epoch(model, criterion, optimizer, data_loader, lr_scheduler, device, epoch, args.print_freq, scaler)
-    #     confmat = evaluate(model, data_loader_test, device=device, num_classes=num_classes)
-    #     print(confmat)
-    #     checkpoint = {
-    #         "model": model_without_ddp.state_dict(),
-    #         "optimizer": optimizer.state_dict(),
-    #         "lr_scheduler": lr_scheduler.state_dict(),
-    #         "epoch": epoch,
-    #         "args": args,
-    #     }
-    #     if args.amp:
-    #         checkpoint["scaler"] = scaler.state_dict()
-    #     utils.save_on_master(checkpoint, os.path.join(args.output_dir, f"model_{epoch}.pth"))
-    #     utils.save_on_master(checkpoint, os.path.join(args.output_dir, "checkpoint.pth"))
-
-    # total_time = time.time() - start_time
-    # total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    # print(f"Training time {total_time_str}")
 
 
 def get_args_parser(add_help=True):
@@ -400,6 +318,12 @@ def get_args_parser(add_help=True):
 
     parser.add_argument("--backend", default="PIL", type=str.lower, help="PIL or tensor - case insensitive")
     parser.add_argument("--use-v2", action="store_true", help="Use V2 transforms")
+    parser.add_argument(
+        "--wandb-key",
+        default="",
+        type=str,
+        help="wandb key for logging. If not provided, wandb will not be used.",
+    )
     return parser
 
 
